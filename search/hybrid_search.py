@@ -9,9 +9,10 @@ if str(BASE_DIR) not in sys.path:
 import json
 import pickle
 import re
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import numpy as np
+
 from d_p.ju_to_em import embed_query  # ✅ 질문 임베딩은 이 함수로 고정
 
 
@@ -33,26 +34,15 @@ def tokenize_kr_mvp(text: str) -> List[str]:
 
 
 # =========================
-# 질문 임베딩 (KURE-v1)
+# 질문 임베딩 (KURE-v1 via ju_to_em.embed_query)
 # =========================
 def embed_query_kure(query: str) -> np.ndarray:
+    """
+    ju_to_em.embed_query()는 이미 np.float32 1D를 반환하도록 구현되어 있음.
+    (detach/cpu 처리 불필요)
+    """
     v = embed_query(query)
-    if hasattr(v, "detach"):
-        v = v.detach().cpu().numpy()
-    return np.array(v, dtype=np.float32).reshape(-1)
-
-
-# =========================
-# docs 로드
-# =========================
-def load_docs() -> List[Dict[str, Any]]:
-    if not DOCS_PATH.exists():
-        raise FileNotFoundError(f"docs.jsonl not found: {DOCS_PATH}")
-    docs = []
-    with DOCS_PATH.open("r", encoding="utf-8") as f:
-        for line in f:
-            docs.append(json.loads(line))
-    return docs
+    return np.asarray(v, dtype=np.float32).reshape(-1)
 
 
 def rank_to_score(indices: List[int]) -> Dict[int, float]:
@@ -64,7 +54,78 @@ def rank_to_score(indices: List[int]) -> Dict[int, float]:
 
 
 # =========================
-# 하이브리드 검색
+# 리소스(문서/인덱스/BM25) 1회 로드 & 재사용
+# =========================
+_DOCS: Optional[List[Dict[str, Any]]] = None
+_BM25 = None
+_FAISS_INDEX = None
+_FAISS = None  # faiss 모듈 (지연 import)
+
+
+def load_docs_once() -> List[Dict[str, Any]]:
+    global _DOCS
+    if _DOCS is not None:
+        return _DOCS
+
+    if not DOCS_PATH.exists():
+        raise FileNotFoundError(f"docs.jsonl not found: {DOCS_PATH}")
+
+    docs: List[Dict[str, Any]] = []
+    with DOCS_PATH.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            docs.append(json.loads(line))
+
+    _DOCS = docs
+    return _DOCS
+
+
+def load_bm25_once():
+    global _BM25
+    if _BM25 is not None:
+        return _BM25
+
+    if not BM25_PATH.exists():
+        raise FileNotFoundError(f"bm25 not found: {BM25_PATH}")
+
+    with BM25_PATH.open("rb") as f:
+        _BM25 = pickle.load(f)
+    return _BM25
+
+
+def load_faiss_once():
+    global _FAISS_INDEX, _FAISS
+    if _FAISS_INDEX is not None:
+        return _FAISS_INDEX
+
+    if not FAISS_PATH.exists():
+        raise FileNotFoundError(f"faiss index not found: {FAISS_PATH}")
+
+    import faiss  # 지연 import
+    _FAISS = faiss
+    _FAISS_INDEX = faiss.read_index(str(FAISS_PATH))
+    return _FAISS_INDEX
+
+
+def warmup():
+    """
+    프로그램 시작 시 1회 로딩:
+    - docs / bm25 / faiss index
+    - 그리고 첫 embed_query() 호출로 모델도 미리 올릴 수 있음(선택)
+    """
+    load_docs_once()
+    load_bm25_once()
+    load_faiss_once()
+
+    # (선택) 모델까지 미리 올려서 첫 질문 지연을 없앰
+    # 너무 무겁다면 주석 처리해도 됨.
+    _ = embed_query_kure("워밍업")
+
+
+# =========================
+# 하이브리드 검색 (로딩 없음, 순수 검색만)
 # =========================
 def hybrid_search(
     query: str,
@@ -74,22 +135,19 @@ def hybrid_search(
     w_vec: float = 0.6,
     w_bm25: float = 0.4,
 ) -> List[Dict[str, Any]]:
-    docs = load_docs()
+    query = (query or "").strip()
+    if not query:
+        return []
 
-    if not FAISS_PATH.exists():
-        raise FileNotFoundError(f"faiss index not found: {FAISS_PATH}")
-    if not BM25_PATH.exists():
-        raise FileNotFoundError(f"bm25 not found: {BM25_PATH}")
-
-    import faiss
-    index = faiss.read_index(str(FAISS_PATH))
-
-    with BM25_PATH.open("rb") as f:
-        bm25 = pickle.load(f)
+    docs = load_docs_once()
+    index = load_faiss_once()
+    bm25 = load_bm25_once()
+    faiss = _FAISS  # load_faiss_once()에서 세팅됨
 
     # (A) Vector retrieve
     qv = embed_query_kure(query).reshape(1, -1).astype(np.float32)
-    faiss.normalize_L2(qv)  # 코사인(IP+정규화) 기반이면 필수
+    # 코사인 유사도(IP + normalize) 기반이면 정규화 필요
+    faiss.normalize_L2(qv)
 
     _, vec_idxs = index.search(qv, topN_vec)
     vec_list = vec_idxs[0].tolist()
@@ -114,8 +172,10 @@ def hybrid_search(
     # (E) 결과
     results = []
     for score, i in merged[:top_k]:
+        if i < 0 or i >= len(docs):
+            continue
         d = docs[i]
-        md = d.get("metadata", {})
+        md = d.get("metadata", {}) or {}
         results.append({
             "score": float(score),
             "doc_id": d.get("doc_id"),
@@ -127,13 +187,30 @@ def hybrid_search(
     return results
 
 
-if __name__ == "__main__":
-    q = "이 규칙의 목적은 무엇인가?"
-    print("[QUERY]", q)
-    out = hybrid_search(q, top_k=5)
+def print_results(results: List[Dict[str, Any]], max_text: int = 220):
+    if not results:
+        print("(no results)")
+        return
 
-    for r in out:
+    for r in results:
         print("\n--- score:", r["score"])
-        print("doc_id :", r["doc_id"])
-        print("loc    :", r["doc_title"], r["path"], r["unit_id"])
-        print("text   :", (r["text"][:220] + "...") if r["text"] else "")
+        print("doc_id :", r.get("doc_id"))
+        print("loc    :", r.get("doc_title"), r.get("path"), r.get("unit_id"))
+        text = r.get("text") or ""
+        print("text   :", (text[:max_text] + "...") if len(text) > max_text else text)
+
+
+if __name__ == "__main__":
+    # ✅ 시작 시 1회 로딩
+    warmup()
+    print("✅ Hybrid Search ready. (type 'exit' to quit)")
+
+    while True:
+        q = input("\n[QUERY] ").strip()
+        if q.lower() in ("exit", "quit"):
+            break
+        if not q:
+            continue
+
+        out = hybrid_search(q, top_k=5)
+        print_results(out)

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Set
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from sentence_transformers.SentenceTransformer import SentenceTransformer
 
 
 OUT_NAME = "all_laws.jsonl"
